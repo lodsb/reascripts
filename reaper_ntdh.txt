@@ -1,0 +1,369 @@
+// (c) 2012, lodsb - Relased under GPL license
+//  Made in bavaria by fat little elves - since 1983
+
+desc: NTDH (note & timing derived humanize)
+slider1:0.01<0.00000001,0.1,0.000000001>Rnd
+slider2:0.5<0.01,16.0,0.01>Impact Timing
+slider3:0.5<0.01,16.0,0.01>Impact Note Disparity
+
+slider4:0.0<0.0,1.0,1.0>Delay CC
+
+slider5:0.5<0.01,32.0,0.01>Scale Audio Mod
+
+@init
+  currDev = 0;
+  currSample = 1;
+  last128th = 0;
+
+// constants
+  statNoteOff = $x80;
+  statNoteOn = $x90;
+
+  epsilon = 0.1;
+  offset = 0.0;
+  bpm = tempo;
+  no128th = 0;
+  no4th = 0;
+
+  lastSecond = 0;
+
+   latency = floor(0.125*srate);
+  // samples to go , msg1, msg2
+  // 32 msgs buffer, hope it works
+  noMsgs = 1024;
+  bufferSize = noMsgs * 4;
+
+  bpos = 0;
+  i = 0;
+  while (
+      bpos[i] = -1000;
+      i += 1;
+      i < bufferSize;
+   );
+
+  lastFullBufferIndex = 0;
+
+  broken = 0;
+  timingImpact = 1.0;
+  lastNote = 61;
+  noteOffset = 0;
+  
+@slider
+  pdc_latency = latency;
+  pdc_midi = 1.0;
+
+
+  rnd = slider1;
+  timingImpact = slider2;
+  noteImpact = slider3;
+  sendCC = slider4;
+  lfoScale = slider5;
+
+  midiIn = 0;
+  midiOut= 0;
+
+  weight = 0;  
+
+@sample
+  bpm = tempo;
+  bps = bpm/60;
+  o128note = 1/(bps*32); // quarternote = beat; 1/128 = 1/(4*32)
+  o128samples = ceil(o128note*srate);
+
+  // sync samples count to seconds from song
+  _pp = floor(play_position);
+  (_pp != lastSecond) ? (
+    lastSecond = _pp;
+    currentSample = 0;
+  );
+
+  currSample = currSample % srate;
+
+  (currSample % o128samples == 0) ? (
+    no128th = no128th + 1;
+    
+    (no128th % 32 == 0) ? (
+      no4th = no4th + 1;
+     );  
+  );
+
+  msg1 = 0;
+  msg23 = 0;
+  while( midirecv(offs,msg1,msg23) ? 
+    ( 
+      status = msg1 & 240;
+      note = msg23&127;
+
+      (status == statNoteOn) ?
+        (
+          // one second deviation
+          offset = no128th-last128th;
+
+          // clip
+          (offset > 128) ? offset = 128.0;
+          (offset < 5 ) ? offset = 1;
+         
+          offset = offset/128;
+          last128th = no128th;
+         
+          noteOffset = (abs(lastNode - note))/128;
+          lastNote = note; 
+       );
+
+      (rand(1.0) >= 0.5) ? (
+        randTiming = 1+rnd;
+      ):(
+        randTiming = 1 -rnd;
+      );
+
+
+      weight = randTiming*((1-offset)*( timingImpact)) + (noteOffset*noteImpact);
+      noteLatency = floor((weight)*o128samples);
+      
+      msgDelay = offs+latency;
+
+      // if msgDelay > neg note latency, we can preschedule, otherwise not!
+      (msgDelay - noteLatency < 0) ? (
+        msgDelay = msgDelay + noteLatency;
+      ):(
+        (rand(1) > 0.5) ? (
+            msgDelay = msgDelay - noteLatency;
+        ):(
+            msgDelay = msgDelay + noteLatency;
+        );
+      );
+      
+
+      insertionIndex = -1;
+
+      sendMsg = 1;
+      status = msg1 & $xF0;
+
+      (status != statNoteOff && (status == statNoteOn || sendCC == 1)) ? (
+            sendMsg = 0;
+
+            // put it in the buffer
+            bpos = 0;
+            i = 0;
+
+            done = 0;
+            while (
+              // if we find a slot with samples to go < 0
+              // then we use it, if we cant find it, the msg is lost
+              // - frig.
+
+              free = bpos[i];
+              (free < 0 && done == 0) ? (
+                bpos[i] = msgDelay;
+                bpos[i+1] = msg1;
+                bpos[i+2] = msg23;
+                bpos[i+3] = weight;
+
+                done = 1;
+                insertionIndex = i;
+              );
+              
+              i += 4;
+              i < bufferSize && done == 0;
+            );                
+            // update gfx
+            (done == 0) ? broken=1;
+            midiIn = 1;                           
+       );
+
+      status = msg1 & $xF0;
+      (status == statNoteOff) ? (
+            sendMsg = 0;
+
+            // put it in the buffer
+            bpos = 0;
+            i = 0;
+            done = 0;
+            
+            while (
+              // if we find a slot with samples to go < 0
+              // then we use it, if we cant find it, the msg is lost
+              // - frig.
+              // we also look for noteons of the same note, so we dont 
+              // schedule the note off before note on!
+
+              free = bpos[i];
+
+              noteOnNote = bpos[i+2]&127;
+              (noteOnNote == note && free > 0) ? (
+                noteOnIndex = i;
+              );
+
+              (free < 0 && done == 0) ? (
+                bpos[i] = msgDelay;
+                bpos[i+1] = msg1;
+                bpos[i+2] = msg23;
+                bpos[i+3] = weight;
+
+                broken = 0;                
+                done = 1;
+
+                noteOffIndex = i;
+                insertionIndex = i;
+              );
+              
+              i += 4;
+              i < bufferSize;
+            );       
+            
+            // fix delays if necessary
+            noteOnDelay = bpos[noteOnIndex];
+            (noteOnDelay >= msgDelay) ? (
+                // delay it by one 0.5*128th note additionally
+                bpos[noteOffIndex] = floor(msgDelay + (noteOnDelay - msgDelay) + (o128samples*0.5));
+            );
+
+            // update gfx
+            (done == 0) ? broken=1;
+            midiIn = 1;                         
+      );
+
+      // if not note on or note off, send it
+      (sendMsg == 1 && sendCC == 0) ? (
+        midisend(offs,msg1,msg23); 
+      );
+
+      // sort buffer - descending
+      // insertion sort style
+      i = 4;
+      while(
+        v1 = bpos[i];
+        v2 = bpos[i+1];
+        v3 = bpos[i+2];
+        v4 = bpos[i+3];
+
+        done = 0;
+        j = i - 4;
+
+        while(
+          (bpos[j] < bpos[i]) ? (
+            bpos[j+4] = bpos[j];
+            bpos[j+5] = bpos[j+1];
+            bpos[j+6] = bpos[j+2];
+            bpos[j+7] = bpos[j+3];
+
+            j = j - 4;
+
+            (j < 0) ? (
+              done = 1;
+            );
+          ):(
+              done = 1;
+          );
+
+          done != 1;
+        ); 
+
+        bpos[j+4] = v1;
+        bpos[j+5] = v2;
+        bpos[j+6] = v3;
+        bpos[j+7] = v4;       
+
+        (bpos[j+4] >= 0) ? (
+          lastFullBufferIndex = j+4;
+        );
+
+        i += 4;
+        i < bufferSize;
+      );
+      
+
+    ); 
+  );
+
+     
+  currSample  = currSample +1 ;
+
+  // send midi!
+  bpos = 0;
+  i = 0;
+  done = 0;
+
+  while (
+    samplesToGo = bpos[i] ;
+
+    // update slot/samplesToGo, if < 0 then it is free
+    bpos[i] = samplesToGo-1; 
+
+    (samplesToGo == 0) ? (
+       m1 = bpos[i+1];
+       m2 = bpos[i+2];
+       midisend(1,m1,m2); 
+       midiOut = 1;
+
+       // audio out = last weight value
+       lfo = lfoScale*bpos[i+3];
+
+       bpos[i] = -100;
+    );
+
+  (i == lastFullBufferIndex+8) ? (
+      done = 1;
+  );
+    
+    i += 4;
+    i < bufferSize && done == 0;
+  );
+
+  spl0 = lfo;
+  spl1 = lfo; 
+
+@gfx 640 400
+  gfx_clear = -1;
+  gfx_x = -1;
+  gfx_y = 0;
+  gfx_blit(-1,1,0);
+
+  gfx_a = 1;
+  gfx_r = 0;
+  gfx_g = 0.5;
+  gfx_b = 0;  
+
+  gfx_x = 200;
+  gfx_y = 10;
+  (midiIn == 1) ? (
+    gfx_lineto(200,60,0);
+  );  
+
+  gfx_r = 0.5;
+  gfx_g = 0.0;
+
+  gfx_x = 200;
+  gfx_y = 60;
+  (midiOut == 1) ? (
+    gfx_lineto(200,110,0);
+  );  
+
+  gfx_r = 1.0;
+  gfx_g = 1.0;
+  gfx_x = 200;
+  gfx_y = 110;
+  (broken == 1) ? (
+    gfx_lineto(200,170,0);
+  );  
+
+  broken = 0;
+  
+  gfx_y = 110 + lfo*-100;
+  gfx_x = 200;
+
+  col = lfo;  
+
+  gfx_setpixel(col,0,1);
+
+  gfx_y = 110 + (1-(lastFullBufferIndex/bufferSize))*-100;
+  gfx_x = 200;
+  gfx_setpixel(0,1,1);
+  
+  gfx_y = 10; gfx_setpixel(1,1,1);
+  gfx_y = 60; gfx_setpixel(1,1,1);
+  gfx_y = 110; gfx_setpixel(1,1,1);
+
+  // gfx 
+  midiIn = 0;
+  midiOut= 0;
